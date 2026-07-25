@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import unquote, urlparse
 
 
 def get_proxy_server(*, use_proxy: bool = True) -> str | None:
@@ -14,7 +15,24 @@ def get_proxy_server(*, use_proxy: bool = True) -> str | None:
 
 
 def get_playwright_proxy(*, use_proxy: bool = True) -> dict[str, str] | None:
+	"""返回 Playwright/Chromium 可用的 proxy 配置。
+
+	Playwright 要求把代理认证拆成 username/password 字段；
+	若把 user:pass 写在 server URL 里，Chromium 会报 net::ERR_INVALID_AUTH_CREDENTIALS。
+	"""
 	server = get_proxy_server(use_proxy=use_proxy)
 	if not server:
 		return None
-	return {'server': server}
+
+	parsed = urlparse(server)
+	if not parsed.scheme or not parsed.hostname:
+		# 非标准 URL 时原样交给 Playwright，避免静默丢代理
+		return {'server': server}
+
+	port = f':{parsed.port}' if parsed.port else ''
+	proxy: dict[str, str] = {'server': f'{parsed.scheme}://{parsed.hostname}{port}'}
+	if parsed.username is not None:
+		proxy['username'] = unquote(parsed.username)
+	if parsed.password is not None:
+		proxy['password'] = unquote(parsed.password)
+	return proxy
