@@ -82,11 +82,20 @@ jobs:
 
     - name: 配置代理
       env:
+        # 自建代理（如 gost 家宽）优先；有值则写入 GITHUB_ENV，后续步骤自动继承
+        CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
+        # 未配自建代理时，用 mihomo 订阅启动本地代理并写入 CHECKIN_PROXY_URL
         PROXY_SUBSCRIPTION_URL: ${{ secrets.PROXY_SUBSCRIPTION_URL }}
         PROXY_TEST_URL: https://www.google.com/generate_204
         MIHOMO_VERSION: v1.19.27
         PROXY_REQUIRED: false
-      run: bash scripts/setup_mihomo_proxy.sh
+      run: |
+        if [ -n "${CHECKIN_PROXY_URL:-}" ]; then
+          echo "[INFO] Using self-hosted CHECKIN_PROXY_URL from secret"
+          echo "CHECKIN_PROXY_URL=${CHECKIN_PROXY_URL}" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        bash scripts/setup_mihomo_proxy.sh
 
     - name: 执行签到
       env:
@@ -95,6 +104,9 @@ jobs:
         CHECKIN_HUMANIZE: true
         CHECKIN_WAIT_TIMEOUT_MS: 120000
         ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+        # CHECKIN_PROXY_URL 由上一步写入 GITHUB_ENV，此处勿再注入 secrets（空值会覆盖）
+        # 需在 secret 中为对应平台打开 use_proxy，例如:
+        # {"anyrouter":{"use_proxy":true},"agentrouter":{"use_proxy":true}}
         PROVIDERS: ${{ secrets.PROVIDERS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
