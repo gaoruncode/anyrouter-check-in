@@ -1,0 +1,33 @@
+# 参考片段：让 GitHub Actions 使用家宽 gost 代理
+# 用法：复制到 .github/workflows/checkin.yml 的「执行签到」步骤 env 中
+# （fork 后改自己的仓库；不必提交到上游）
+#
+# 同时在 Settings → Environments → production → Environment secrets 配置：
+#   CHECKIN_PROXY_URL = http://checkin:强密码@proxy.example.com:27890
+#   PROVIDERS         = {"anyrouter":{"use_proxy":true},"agentrouter":{"use_proxy":true}}
+
+# --- 在「执行签到」job step 的 env: 下增加 ---
+# CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
+# PROVIDERS: ${{ secrets.PROVIDERS }}
+#
+# 说明：
+# - PROVIDERS 若你已在 secrets 中配置，保持原有注入即可
+# - 有 CHECKIN_PROXY_URL 时可不配 PROXY_SUBSCRIPTION_URL（不必再启 mihomo）
+
+name: snippet-only-not-a-workflow
+on:
+  workflow_dispatch: {}
+
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: 执行签到（示例 env）
+        env:
+          ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+          # 家宽代理（gost + 域名端口映射）
+          CHECKIN_PROXY_URL: ${{ secrets.CHECKIN_PROXY_URL }}
+          # 必须打开 use_proxy，否则不会走代理
+          PROVIDERS: ${{ secrets.PROVIDERS }}
+        run: echo "把上面两个 env 合并进你自己的 checkin workflow 即可"

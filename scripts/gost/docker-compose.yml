@@ -1,0 +1,32 @@
+# Alpine + gost 最简部署
+# 用法:
+#   1. cp .env.example .env  并修改密码
+#   2. docker compose up -d
+#   3. curl -x http://checkin:密码@宿主机IP:7890 https://api.ipify.org
+#
+# 重要: 宿主机不要挂全局 VPN，否则出口 IP 会变成 VPN IP。
+
+services:
+  gost:
+    build: .
+    image: anyrouter-gost:alpine
+    container_name: anyrouter-gost
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GOST_USER: ${GOST_USER:-checkin}
+      GOST_PASS: ${GOST_PASS:?set GOST_PASS in .env}
+      GOST_PORT: ${GOST_PORT:-7890}
+      TZ: Asia/Shanghai
+    # Linux 推荐 host 网络：少一层 NAT，路由映射直接指宿主机
+    network_mode: host
+    # 若运行环境不支持 host 网络（如部分 Docker Desktop），
+    # 注释掉上面的 network_mode: host，改用下面 ports:
+    # ports:
+    #   - "${GOST_PORT:-7890}:7890"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

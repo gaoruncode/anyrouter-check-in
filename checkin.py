@@ -22,10 +22,12 @@ from dotenv import load_dotenv
 from utils.browser import (
 	BrowserLoginResult,
 	has_session_cookie,
+	inject_github_cookies,
 	is_logged_in,
 	launch_login_context,
 	load_browser_login_settings,
 	login_with_email_form,
+	login_with_github_oauth,
 	navigate_login_page,
 	prepare_browser_page,
 	save_login_screenshot,
@@ -234,6 +236,105 @@ async def login_with_credentials(
 		return None
 
 
+async def login_with_github(
+	account_name: str,
+	provider_config,
+	provider_name: str,
+	github_cookies: dict,
+) -> BrowserLoginResult | None:
+	"""使用 GitHub 会话 cookies 通过浏览器 OAuth 登录，返回 cookies 与 api user id。"""
+	print(f'[PROCESSING] {account_name}: Logging in with GitHub OAuth (session cookies)...')
+
+	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	settings = load_browser_login_settings(
+		account_name,
+		provider_name,
+		persist_profile=provider_config.persist_profile,
+	)
+	timeout_ms = settings.wait_timeout_ms
+
+	debug_print(
+		f'[INFO] {account_name}: Browser profile={settings.profile_dir}, '
+		f'persist={settings.persist_profile}, headless={settings.headless}, '
+		f'humanize={settings.humanize}, timeout={timeout_ms}ms'
+	)
+
+	print(
+		f'[INFO] {account_name}: Provider proxy={"enabled" if provider_config.use_proxy else "disabled"} '
+		f'({provider_name})'
+	)
+
+	try:
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		# Inject GitHub session cookies before navigating
+		await inject_github_cookies(context, github_cookies)
+
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
+
+		if not await is_logged_in(page):
+			await save_login_screenshot(page, provider_name, account_name, 'before-github-login')
+			# Extract domain for OAuth redirect detection
+			from urllib.parse import urlparse
+
+			expected_domain = urlparse(provider_config.domain).netloc
+			page = await login_with_github_oauth(
+				page,
+				github_cookies,
+				timeout_ms,
+				provider=provider_name,
+				account_name=account_name,
+				expected_domain=expected_domain,
+			)
+		else:
+			print(f'[INFO] {account_name}: Browser profile already logged in')
+
+		console_url = f'{provider_config.domain}/console'
+		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		if not user_profile:
+			cookies = await context.cookies()
+			cookie_names = [c.get('name') for c in cookies if c.get('name')]
+			print(f'[FAILED] {account_name}: GitHub login failed - /api/user/self not verified')
+			debug_print(f'[INFO] {account_name}: Current URL: {page.url}')
+			debug_print(f'[INFO] {account_name}: Got cookies: {cookie_names}')
+			await save_login_screenshot(page, provider_name, account_name, 'github-not-authenticated')
+			await context.close()
+			return None
+
+		cookies = await context.cookies()
+		all_cookies = {
+			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
+		}
+		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
+
+		success_msg = f'[SUCCESS] {account_name}: GitHub login successful, got {len(all_cookies)} cookies'
+		if is_debug_enabled() and api_user:
+			success_msg += f', api_user={api_user}'
+		print(success_msg)
+		await context.close()
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during GitHub login: {e}')
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'github-login-error')
+		await context.close()
+		return None
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -362,7 +463,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 邮箱密码优先
+	# 邮箱密码优先，其次 GitHub OAuth，最后 session cookies
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
@@ -382,6 +483,27 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			auth_method = 'email/password'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
+			return False, None, None
+	elif account.has_github_credentials():
+		print(f'[INFO] {account_name}: Attempting GitHub OAuth login...')
+		assert account.github_cookies is not None
+		# Parse github_cookies if it's a string
+		gh_cookies = parse_cookies(account.github_cookies) if isinstance(account.github_cookies, str) else account.github_cookies
+		if not gh_cookies:
+			print(f'[FAILED] {account_name}: Invalid github_cookies format')
+			return False, None, None
+		login_result = await login_with_github(
+			account_name,
+			provider_config,
+			account.provider,
+			gh_cookies,
+		)
+		if login_result:
+			all_cookies = login_result.cookies
+			resolved_api_user = login_result.api_user
+			auth_method = 'github_oauth'
+		else:
+			print(f'[FAILED] {account_name}: GitHub OAuth login failed')
 			return False, None, None
 	else:
 		user_cookies = parse_cookies(account.cookies)

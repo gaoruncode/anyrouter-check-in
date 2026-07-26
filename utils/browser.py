@@ -53,6 +53,16 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+OAUTH_REDIRECT_TIMEOUT_MS = 60_000
+
+GITHUB_LOGIN_BUTTON_SELECTORS = (
+	'button:has(.semi-icon-github)',
+	'button:has([aria-label="github"])',
+	'a[href*="github.com/login/oauth"]',
+	'button:has-text("GitHub")',
+	'.semi-card button:has-text("GitHub")',
+)
+GITHUB_2FA_SELECTORS = ('#app_totp_code', 'input[name="otp"]')
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -777,3 +787,294 @@ async def login_with_email_form(
 	)
 	await fill_email_credentials(page, email, password, timeout_ms)
 	await submit_login_form(page, timeout_ms)
+
+
+# ---------------------------------------------------------------------------
+# GitHub OAuth login
+# ---------------------------------------------------------------------------
+
+
+async def _click_github_login_entry(page: Page) -> bool:
+	"""Find and click the GitHub login button on the site login page."""
+	for selector in GITHUB_LOGIN_BUTTON_SELECTORS:
+		try:
+			locator = page.locator(selector).first
+			if await locator.is_visible():
+				if await _click_locator(locator):
+					return True
+		except Exception:  # nosec B112
+			continue
+
+	# Fallback: search by role/text
+	for scope in (page.locator('.semi-card'), page):
+		try:
+			button = scope.get_by_role('button', name=re.compile(r'GitHub', re.I)).first
+			if await button.is_visible() and await _click_locator(button):
+				return True
+		except Exception:  # nosec B112
+			continue
+
+	return False
+
+
+GITHUB_AUTHORIZE_SELECTORS = (
+	'button[name="authorize"]',
+	'button[type="submit"]:has-text("Authorize")',
+	'button:has-text("Authorize")',
+	'input[type="submit"][value*="Authorize"]',
+	'#js-oauth-authorize-btn',
+)
+
+
+async def _handle_github_login_page(page: Page, timeout_ms: int) -> None:
+	"""Detect GitHub login form / 2FA / authorize page while relying on cookie injection."""
+	# Check for 2FA
+	for selector in GITHUB_2FA_SELECTORS:
+		try:
+			if await page.locator(selector).first.is_visible():
+				raise RuntimeError(
+					'GitHub 2FA verification required. '
+					'Please refresh your github_cookies or login manually once with CHECKIN_HEADLESS=false.'
+				)
+		except RuntimeError:
+			raise
+		except Exception:  # nosec B112
+			continue
+
+	# If we see a login form, the injected cookies are invalid/expired
+	login_indicators = ('#login_field', 'input[name="login"]', '#password', 'input[name="password"]')
+	for selector in login_indicators:
+		try:
+			if await page.locator(selector).first.is_visible():
+				raise RuntimeError(
+					'GitHub session cookies expired or invalid (login form appeared). '
+					'Please update github_cookies with fresh values from your browser.'
+				)
+		except RuntimeError:
+			raise
+		except Exception:  # nosec B112
+			continue
+
+	# First-time OAuth may require clicking Authorize
+	action_timeout = min(timeout_ms, FORM_ACTION_TIMEOUT_MS)
+	for selector in GITHUB_AUTHORIZE_SELECTORS:
+		try:
+			locator = page.locator(selector).first
+			if await locator.is_visible():
+				print('[INFO] GitHub authorize page detected, clicking Authorize...')
+				await _click_locator(locator)
+				try:
+					await page.wait_for_load_state('domcontentloaded', timeout=action_timeout)
+				except Exception:  # nosec B110
+					pass
+				return
+		except Exception:  # nosec B112
+			continue
+
+
+async def _wait_for_oauth_redirect(page: Page, expected_domain: str, timeout_ms: int) -> bool:
+	"""Wait until the page URL redirects back to the expected domain."""
+	deadline = time.monotonic() + timeout_ms / 1000
+	while time.monotonic() < deadline:
+		current_url = page.url.lower()
+		if expected_domain in current_url and 'github.com' not in current_url:
+			return True
+		# Keep handling authorize/2FA/login while waiting
+		if 'github.com' in current_url:
+			try:
+				await _handle_github_login_page(page, min(timeout_ms, FORM_ACTION_TIMEOUT_MS))
+			except RuntimeError:
+				raise
+			except Exception:  # nosec B110
+				pass
+		await asyncio.sleep(0.5)
+	return False
+
+
+async def _wait_for_oauth_completion(
+	page: Page,
+	expected_domain: str,
+	timeout_ms: int,
+	*,
+	oauth_popup: Page | None = None,
+) -> Page:
+	"""Wait for OAuth to finish, tracking either same-tab navigation or popup window.
+
+	Returns the page that ends up on the site domain (popup may become the active one).
+	Will not return early if the page is still on /login or /signin.
+	"""
+	redirect_timeout = min(timeout_ms, OAUTH_REDIRECT_TIMEOUT_MS)
+	deadline = time.monotonic() + redirect_timeout / 1000
+	pages = [p for p in (page, oauth_popup) if p is not None]
+	login_paths = ('/login', '/signin', '/sign-in')
+
+	while time.monotonic() < deadline:
+		for candidate in list(pages):
+			try:
+				if candidate.is_closed():
+					continue
+				url = candidate.url.lower()
+			except Exception:  # nosec B112
+				continue
+
+			if expected_domain and expected_domain in url and 'github.com' not in url:
+				# Make sure we're not still on the login page
+				if not any(p in url for p in login_paths):
+					return candidate
+				# Still on login — keep waiting for redirect to /console or /
+
+			if 'github.com' in url:
+				try:
+					await _handle_github_login_page(candidate, min(timeout_ms, FORM_ACTION_TIMEOUT_MS))
+				except RuntimeError:
+					raise
+				except Exception:  # nosec B110
+					pass
+
+		# Newly opened pages (popup may appear slightly later)
+		try:
+			for extra in page.context.pages:
+				if extra not in pages:
+					pages.append(extra)
+		except Exception:  # nosec B110
+			pass
+
+		await asyncio.sleep(0.5)
+
+	urls = []
+	for candidate in pages:
+		try:
+			if not candidate.is_closed():
+				urls.append(candidate.url)
+		except Exception:  # nosec B110
+			pass
+	raise TimeoutError(
+		f'OAuth redirect back to {expected_domain} timed out. Observed URLs: {urls or [page.url]}'
+	)
+
+
+async def inject_github_cookies(context: BrowserContext, github_cookies: dict[str, str]) -> None:
+	"""Inject GitHub session cookies into the browser context.
+
+	Use ``url`` (not domain) so Playwright accepts host-only cookies such as
+	``__Host-user_session_same_site``. Session cookies get httpOnly when applicable.
+	"""
+	http_only_names = {'user_session', '_gh_sess', '__Host-user_session_same_site'}
+	cookie_list: list[dict] = []
+	for name, value in github_cookies.items():
+		if not name or value is None or value == '':
+			continue
+		cookie_list.append(
+			{
+				'name': name,
+				'value': str(value),
+				'url': 'https://github.com/',
+				'httpOnly': name in http_only_names,
+				'secure': True,
+				'sameSite': 'Lax',
+			}
+		)
+
+	if not cookie_list:
+		raise ValueError('github_cookies is empty after filtering')
+
+	await context.add_cookies(cookie_list)
+	print(f'[INFO] Injected {len(cookie_list)} GitHub session cookie(s)')
+
+
+async def login_with_github_oauth(
+	page: Page,
+	github_cookies: dict[str, str],
+	timeout_ms: int,
+	*,
+	provider: str = '',
+	account_name: str = '',
+	expected_domain: str = '',
+) -> Page:
+	"""Complete GitHub OAuth login flow using pre-injected GitHub session cookies.
+
+	Steps:
+	1. Inject GitHub cookies into browser context (done by caller).
+	2. Click the GitHub login button on the site login page (may open popup).
+	3. GitHub recognizes the session -> auto-authorize redirect.
+	4. Wait for redirect back to the site.
+	5. If GitHub login form appears -> cookies expired, raise error.
+
+	Returns the page that landed on the provider domain after OAuth.
+	"""
+	_ = github_cookies  # injected by caller; kept for API compatibility
+	print(f'[INFO] {account_name or "account"}: Starting GitHub OAuth login (cookie injection)...')
+
+	oauth_popup: Page | None = None
+	popup_future: asyncio.Future | None = None
+	try:
+		popup_future = page.context.wait_for_event('page', timeout=min(timeout_ms, 15_000))
+	except Exception:  # nosec B110
+		popup_future = None
+
+	# Step 1: Click GitHub login button
+	if not await _click_github_login_entry(page):
+		if provider and account_name:
+			await save_login_screenshot(page, provider, account_name, 'github-button-not-found')
+		raise TimeoutError('Cannot find GitHub login button on login page')
+
+	print(f'[INFO] {account_name or "account"}: Clicked GitHub login button, waiting for OAuth...')
+
+	# Step 2: Capture popup window if OAuth opens a new tab
+	if popup_future is not None:
+		try:
+			oauth_popup = await popup_future
+			print(f'[INFO] {account_name or "account"}: OAuth opened in popup window')
+			try:
+				await oauth_popup.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 30_000))
+			except Exception:  # nosec B110
+				pass
+		except Exception:  # nosec B110
+			oauth_popup = None
+
+	await asyncio.sleep(1.5)
+	try:
+		await page.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 15_000))
+	except Exception:  # nosec B110
+		pass
+
+	# Step 3: Wait for OAuth completion (same tab or popup)
+	active_page = page
+	if expected_domain:
+		try:
+			active_page = await _wait_for_oauth_completion(
+				page,
+				expected_domain,
+				timeout_ms,
+				oauth_popup=oauth_popup,
+			)
+		except TimeoutError:
+			if provider and account_name:
+				await save_login_screenshot(page, provider, account_name, 'oauth-redirect-timeout')
+				if oauth_popup is not None and not oauth_popup.is_closed():
+					await save_login_screenshot(
+						oauth_popup, provider, account_name, 'oauth-popup-timeout'
+					)
+			raise
+	else:
+		# No domain hint: still try to handle GitHub pages we can see
+		for candidate in (oauth_popup, page):
+			if candidate is None:
+				continue
+			try:
+				if not candidate.is_closed() and 'github.com' in candidate.url.lower():
+					await _handle_github_login_page(candidate, timeout_ms)
+					active_page = candidate
+			except RuntimeError:
+				raise
+			except Exception:  # nosec B110
+				pass
+
+	# Wait for session cookie on the page that completed OAuth
+	if not await wait_for_session_cookie(active_page, SESSION_WAIT_TIMEOUT_MS):
+		if provider and account_name:
+			await save_login_screenshot(active_page, provider, account_name, 'oauth-no-session')
+		raise TimeoutError(f'OAuth finished but session cookie was not set. Current URL: {active_page.url}')
+
+	print(f'[SUCCESS] {account_name or "account"}: GitHub OAuth login completed')
+	return active_page

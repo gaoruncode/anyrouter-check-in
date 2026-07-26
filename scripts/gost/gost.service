@@ -1,0 +1,35 @@
+# systemd 单元示例：gost HTTP 代理开机自启
+#
+# 安装步骤:
+#   1. 将 gost 放到 /usr/local/bin/gost
+#   2. 修改下面 User / 密码
+#   3. sudo cp gost.service /etc/systemd/system/gost-checkin.service
+#   4. sudo systemctl daemon-reload
+#   5. sudo systemctl enable --now gost-checkin.service
+#   6. sudo systemctl status gost-checkin.service
+
+[Unit]
+Description=gost HTTP proxy for anyrouter check-in
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建议改成专用低权限用户
+User=root
+Environment=GOST_USER=checkin
+Environment=GOST_PASS=请改成超长随机密码
+Environment=GOST_PORT=7890
+ExecStart=/usr/local/bin/gost -L http://${GOST_USER}:${GOST_PASS}@:${GOST_PORT}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+# 安全加固（可选）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
