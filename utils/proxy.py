@@ -14,11 +14,13 @@ def get_proxy_server(*, use_proxy: bool = True) -> str | None:
 	return server or None
 
 
-def get_playwright_proxy(*, use_proxy: bool = True) -> dict[str, str] | None:
+def get_playwright_proxy(*, use_proxy: bool = True, bypass: str | None = None) -> dict[str, str] | None:
 	"""返回 Playwright/Chromium 可用的 proxy 配置。
 
 	Playwright 要求把代理认证拆成 username/password 字段；
 	若把 user:pass 写在 server URL 里，Chromium 会报 net::ERR_INVALID_AUTH_CREDENTIALS。
+
+	``bypass`` 可选，逗号分隔的域名列表，这些域名不走代理（如 ``github.com``）。
 	"""
 	server = get_proxy_server(use_proxy=use_proxy)
 	if not server:
@@ -35,4 +37,6 @@ def get_playwright_proxy(*, use_proxy: bool = True) -> dict[str, str] | None:
 		proxy['username'] = unquote(parsed.username)
 	if parsed.password is not None:
 		proxy['password'] = unquote(parsed.password)
+	if bypass:
+		proxy['bypass'] = bypass
 	return proxy

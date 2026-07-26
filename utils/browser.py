@@ -210,7 +210,7 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False, proxy_bypass: str | None = None) -> BrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -221,11 +221,14 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 	if settings.humanize:
 		launch_kwargs['human_preset'] = 'careful'
 
-	proxy = get_playwright_proxy(use_proxy=use_proxy)
+	proxy = get_playwright_proxy(use_proxy=use_proxy, bypass=proxy_bypass)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
 		if is_debug_enabled():
-			print(f'[INFO] Browser proxy enabled: {proxy["server"]}')
+			msg = f'[INFO] Browser proxy enabled: {proxy["server"]}'
+			if proxy.get('bypass'):
+				msg += f' (bypass: {proxy["bypass"]})'
+			print(msg)
 		else:
 			print('[INFO] Browser proxy enabled')
 	elif use_proxy:
@@ -906,24 +909,30 @@ async def _wait_for_oauth_completion(
 	redirect_timeout = min(timeout_ms, OAUTH_REDIRECT_TIMEOUT_MS)
 	deadline = time.monotonic() + redirect_timeout / 1000
 	pages = [p for p in (page, oauth_popup) if p is not None]
-	login_paths = ('/login', '/signin', '/sign-in')
+	login_paths = ('/login', '/signin', '/sign-in', 'about:blank')
 
 	while time.monotonic() < deadline:
 		for candidate in list(pages):
 			try:
 				if candidate.is_closed():
 					continue
-				url = candidate.url.lower()
+				url = candidate.url.lower().rstrip('/')
 			except Exception:  # nosec B112
+				continue
+
+			# Skip blank/empty pages
+			if url in ('about:blank', ''):
 				continue
 
 			if expected_domain and expected_domain in url and 'github.com' not in url:
 				# Make sure we're not still on the login page
 				if not any(p in url for p in login_paths):
+					print(f'[INFO] OAuth redirect detected: {url}')
 					return candidate
 				# Still on login — keep waiting for redirect to /console or /
 
 			if 'github.com' in url:
+				print(f'[INFO] On GitHub OAuth page: {url[:80]}')
 				try:
 					await _handle_github_login_page(candidate, min(timeout_ms, FORM_ACTION_TIMEOUT_MS))
 				except RuntimeError:
@@ -936,6 +945,7 @@ async def _wait_for_oauth_completion(
 			for extra in page.context.pages:
 				if extra not in pages:
 					pages.append(extra)
+					print(f'[INFO] New page detected: {extra.url[:80]}')
 		except Exception:  # nosec B110
 			pass
 
@@ -1022,15 +1032,26 @@ async def login_with_github_oauth(
 
 	# Step 2: Capture popup window if OAuth opens a new tab
 	if popup_future is not None:
-		try:
-			oauth_popup = await popup_future
-			print(f'[INFO] {account_name or "account"}: OAuth opened in popup window')
 			try:
-				await oauth_popup.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 30_000))
+				oauth_popup = await popup_future
+				print(f'[INFO] {account_name or "account"}: OAuth opened in popup window')
+				# Wait for the popup to actually navigate away from about:blank
+				try:
+					await oauth_popup.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 30_000))
+				except Exception:  # nosec B110
+					pass
+				# If popup is still at about:blank after a short wait, the navigation may have failed
+				if oauth_popup.url == 'about:blank':
+					print(f'[WARN] {account_name or "account"}: OAuth popup stuck at about:blank, waiting for navigation...')
+					try:
+						await oauth_popup.wait_for_url(
+							lambda url: url != 'about:blank',
+							timeout=min(timeout_ms, 20_000),
+						)
+					except Exception:  # nosec B110
+						pass
 			except Exception:  # nosec B110
-				pass
-		except Exception:  # nosec B110
-			oauth_popup = None
+				oauth_popup = None
 
 	await asyncio.sleep(1.5)
 	try:

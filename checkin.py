@@ -265,7 +265,11 @@ async def login_with_github(
 	)
 
 	try:
-		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+		context = await launch_login_context(
+			settings,
+			use_proxy=provider_config.use_proxy,
+			proxy_bypass='github.com',
+		)
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
 		return None
